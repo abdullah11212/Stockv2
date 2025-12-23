@@ -24,22 +24,30 @@ tf.random.set_seed(SEED)
 # ============================================================================
 # FUNCTION: Load historical stock data
 # ============================================================================
-def load_data(ticker, end_date="2025-12-18"):
+def load_data(ticker, end_date=None):
+    """
+    Download historical stock data using yfinance.
+    Uses Adjusted Close if available, otherwise Close.
+    """
     data = yf.download(ticker, period="max", end=end_date)
+    if data.empty:
+        return data
+    
     if 'Adj Close' in data.columns:
         data['Price'] = data['Adj Close']
     else:
         data['Price'] = data['Close']
-    return data
+    
+    return data[['Price']]
 
 # ============================================================================
-# FUNCTION: Perform statistical analysis
+# FUNCTION: Statistical analysis on log returns
 # ============================================================================
 def statistical_analysis(data):
     log_returns = np.log(data['Price'] / data['Price'].shift(1)).dropna()
+    
     mean_return = float(log_returns.mean())
     volatility = float(log_returns.std(ddof=1))
-    variance = float(log_returns.var(ddof=1))
     skewness = float(log_returns.skew())
     excess_kurtosis = float(log_returns.kurt())
     pearson_kurtosis = excess_kurtosis + 3
@@ -49,9 +57,9 @@ def statistical_analysis(data):
     ad_result = stats.anderson(log_returns, dist='norm')
     
     threshold = 3 * volatility
-    data['Log_Return'] = log_returns
+    data['Log_Return'] = np.log(data['Price'] / data['Price'].shift(1))
+    data['Jump'] = (np.abs(data['Log_Return'] - mean_return) > threshold).astype(int)
     data.dropna(inplace=True)
-    data['Jump'] = ((data['Log_Return'] - mean_return).abs() > threshold).astype(int)
     jump_count = int(data['Jump'].sum())
     jump_percent = 100 * jump_count / len(data)
     
@@ -61,20 +69,18 @@ def statistical_analysis(data):
         tail_type = "Platykurtic (Thin tails)"
     else:
         tail_type = "Mesokurtic (≈ Normal)"
-        
-    if ad_result.statistic > ad_result.critical_values[2]:
-        normality_conclusion = "❌ Reject Normality"
-    else:
-        normality_conclusion = "✔ Fail to Reject Normality"
+    
+    normality_conclusion = "❌ Reject Normality" if ad_result.statistic > ad_result.critical_values[2] else "✔ Fail to Reject Normality"
     
     return {
-        'mean_return': mean_return, 'volatility': volatility, 'variance': variance,
-        'skewness': skewness, 'excess_kurtosis': excess_kurtosis,
-        'pearson_kurtosis': pearson_kurtosis, 'tail_type': tail_type,
-        'ks_D': ks_D, 'ks_p': ks_p, 'shapiro_stat': shapiro_stat, 'shapiro_p': shapiro_p,
+        'mean_return': mean_return, 'volatility': volatility, 'skewness': skewness,
+        'excess_kurtosis': excess_kurtosis, 'pearson_kurtosis': pearson_kurtosis,
+        'tail_type': tail_type, 'ks_D': ks_D, 'ks_p': ks_p,
+        'shapiro_stat': shapiro_stat, 'shapiro_p': shapiro_p,
         'ad_statistic': ad_result.statistic, 'ad_critical_values': ad_result.critical_values,
-        'normality_conclusion': normality_conclusion, 'threshold': threshold,
-        'jump_count': jump_count, 'jump_percent': jump_percent, 'data': data
+        'normality_conclusion': normality_conclusion,
+        'threshold': threshold, 'jump_count': jump_count, 'jump_percent': jump_percent,
+        'data': data
     }
 
 # ============================================================================
@@ -110,8 +116,7 @@ def heston_model(data):
     
     data['Volatility'] = v_path
     
-    heston_params = {'kappa': kappa, 'theta': theta, 'sigma_v': sigma_v, 'rho': rho, 'v0': v0}
-    return heston_params, v_path, data
+    return {'kappa': kappa, 'theta': theta, 'sigma_v': sigma_v, 'rho': rho, 'v0': v0}, data
 
 # ============================================================================
 # FUNCTION: Prepare sequences
@@ -132,7 +137,7 @@ def prepare_sequences(data, seq_len=60):
     return X_train, X_test, y_train, y_test, scaler, scaled_features
 
 # ============================================================================
-# FUNCTION: Build and train GRU model
+# FUNCTION: Build and train GRU
 # ============================================================================
 def build_gru_model(X_train, y_train, X_test, y_test):
     model = Sequential([
@@ -143,227 +148,223 @@ def build_gru_model(X_train, y_train, X_test, y_test):
         Dense(1)
     ])
     model.compile(optimizer='adam', loss='mse')
-    history = model.fit(X_train, y_train, validation_data=(X_test, y_test), epochs=25, batch_size=32, verbose=0)
+    history = model.fit(X_train, y_train, validation_data=(X_test, y_test),
+                        epochs=25, batch_size=32, verbose=0)
     return model, history
 
 # ============================================================================
 # FUNCTION: Evaluate model
 # ============================================================================
 def evaluate_model(model, X_train, y_train, X_test, y_test, scaler, scaled_features):
-    # Test set predictions
-    pred_scaled = model.predict(X_test, verbose=0)
-    test_full = np.zeros((len(pred_scaled), scaled_features.shape[1]))
-    test_full[:, 0] = pred_scaled[:, 0]
-    pred_rescaled = scaler.inverse_transform(test_full)[:, 0]
+    def inverse_price(pred_scaled):
+        full = np.zeros((len(pred_scaled), 2))
+        full[:, 0] = pred_scaled.flatten()
+        return scaler.inverse_transform(full)[:, 0]
     
-    actual_full = np.zeros((len(y_test), scaled_features.shape[1]))
-    actual_full[:, 0] = y_test
-    actual_prices = scaler.inverse_transform(actual_full)[:, 0]
+    pred_train = inverse_price(model.predict(X_train, verbose=0))
+    pred_test = inverse_price(model.predict(X_test, verbose=0))
+    actual_train = inverse_price(y_train)
+    actual_test = inverse_price(y_test)
     
-    # Training set predictions
-    pred_scaled_train = model.predict(X_train, verbose=0)
-    train_full = np.zeros((len(pred_scaled_train), scaled_features.shape[1]))
-    train_full[:, 0] = pred_scaled_train[:, 0]
-    pred_rescaled_train = scaler.inverse_transform(train_full)[:, 0]
+    metrics = lambda actual, pred: {
+        'mae': mean_absolute_error(actual, pred),
+        'rmse': np.sqrt(mean_squared_error(actual, pred)),
+        'mape': np.mean(np.abs((actual - pred) / actual)) * 100,
+        'r2': r2_score(actual, pred)
+    }
     
-    actual_full_train = np.zeros((len(y_train), scaled_features.shape[1]))
-    actual_full_train[:, 0] = y_train
-    actual_prices_train = scaler.inverse_transform(actual_full_train)[:, 0]
+    train_metrics = metrics(actual_train, pred_train)
+    test_metrics = metrics(actual_test, pred_test)
     
     return {
-        'actual_prices_train': actual_prices_train,
-        'pred_rescaled_train': pred_rescaled_train,
-        'actual_prices': actual_prices,
-        'pred_rescaled': pred_rescaled,
-        'mae_train': mean_absolute_error(actual_prices_train, pred_rescaled_train),
-        'rmse_train': np.sqrt(mean_squared_error(actual_prices_train, pred_rescaled_train)),
-        'r2_train': r2_score(actual_prices_train, pred_rescaled_train),
-        'mape_train': np.mean(np.abs((actual_prices_train - pred_rescaled_train) / actual_prices_train)) * 100,
-        'mae_test': mean_absolute_error(actual_prices, pred_rescaled),
-        'rmse_test': np.sqrt(mean_squared_error(actual_prices, pred_rescaled)),
-        'r2_test': r2_score(actual_prices, pred_rescaled),
-        'mape_test': np.mean(np.abs((actual_prices - pred_rescaled) / actual_prices)) * 100
+        'actual_prices_train': actual_train, 'pred_rescaled_train': pred_train,
+        'actual_prices': actual_test, 'pred_rescaled': pred_test,
+        **{f'{k}_train': v for k, v in train_metrics.items()},
+        **{f'{k}_test': v for k, v in test_metrics.items()}
     }
 
 # ============================================================================
-# FUNCTION: Future Forecast
+# FUNCTION: Future forecast (consistent with train/test)
 # ============================================================================
-def future_forecast(model, data, scaler, scaled_features, seq_len, n_days, heston_params):
-    kappa = heston_params['kappa']
-    theta = heston_params['theta']
-    sigma_v = heston_params['sigma_v']
-    v0 = heston_params['v0']
+def future_forecast(model, scaled_features, scaler, seq_len, n_days, heston_params):
+    kappa, theta, sigma_v, v0 = heston_params['kappa'], heston_params['theta'], \
+                                heston_params['sigma_v'], heston_params['v0']
     dt = 1/252
     
     last_sequence = scaled_features[-seq_len:].copy()
-    future_predictions = []
-    future_volatilities = []
+    future_prices_scaled = []
+    future_vols = []
     
-    v_current = data['Volatility'].iloc[-1] ** 2
+    # Start from last actual volatility (inverse scale to get real vol → variance)
+    last_scaled_vol = scaled_features[-1, 1]
+    dummy = np.zeros((1, 2))
+    dummy[0, 1] = last_scaled_vol
+    last_vol = scaler.inverse_transform(dummy)[0, 1]
+    v_current = last_vol ** 2
     
-    for day in range(n_days):
-        input_seq = last_sequence.reshape(1, seq_len, scaled_features.shape[1])
-        next_pred_scaled = model.predict(input_seq, verbose=0)[0, 0]
+    for _ in range(n_days):
+        input_seq = last_sequence.reshape((1, seq_len, 2))
+        next_price_scaled = model.predict(input_seq, verbose=0)[0, 0]
         
+        # Heston volatility simulation
         dv = kappa * (theta - v_current) * dt + sigma_v * np.sqrt(max(v_current, 1e-8)) * np.random.normal() * np.sqrt(dt)
         v_current = max(v_current + dv, 1e-8)
         next_vol = np.sqrt(v_current)
-        future_volatilities.append(next_vol)
         
-        temp_features = np.array([[0, next_vol]])
-        scaled_temp = scaler.transform(temp_features)
-        next_vol_scaled = scaled_temp[0, 1]
+        # Scale volatility for next input
+        dummy_vol = np.array([[0, next_vol]])
+        next_vol_scaled = scaler.transform(dummy_vol)[0, 1]
         
-        next_step = np.array([[next_pred_scaled, next_vol_scaled]])
-        last_sequence = np.vstack([last_sequence[1:], next_step])
-        future_predictions.append(next_step[0])
+        # Update sequence
+        next_step = np.array([next_price_scaled, next_vol_scaled])
+        last_sequence = np.append(last_sequence[1:], [next_step], axis=0)
+        
+        future_prices_scaled.append(next_price_scaled)
+        future_vols.append(next_vol)
     
-    future_predictions = np.array(future_predictions)
-    future_prices = scaler.inverse_transform(future_predictions)[:, 0]
+    # Inverse transform prices
+    pred_array = np.array(future_prices_scaled).reshape(-1, 1)
+    dummy_vol_col = np.zeros((len(pred_array), 1))
+    full = np.hstack([pred_array, dummy_vol_col])
+    future_prices = scaler.inverse_transform(full)[:, 0]
     
-    last_date = data.index[-1]
-    future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=n_days, freq='D')
-    
-    return future_dates, future_prices, future_volatilities
+    return future_prices, future_vols
 
 # ============================================================================
-# STREAMLIT APPLICATION
+# STREAMLIT APP
 # ============================================================================
 def main():
-    st.set_page_config(page_title="Stock Price Predictor", layout="wide")
-    
-    st.title("📈 Unified Stock Analysis & Forecast")
+    st.set_page_config(page_title="Advanced Stock Predictor: Heston + GRU", layout="wide")
+    st.title("📈 Advanced Stock Price Prediction")
+    st.markdown("### Heston Stochastic Volatility + GRU Neural Network")
     st.markdown("---")
     
     st.sidebar.header("⚙️ Configuration")
-    ticker_input = st.sidebar.text_input("Enter Stock Ticker:", value="GBCO.CA")
-    n_days = st.sidebar.number_input("Prediction Days:", min_value=1, max_value=365, value=30)
-    run_button = st.sidebar.button("🚀 Run Analysis", type="primary")
+    ticker_input = st.sidebar.text_input("Stock Ticker", value="GBCO.CA").upper().strip()
+    n_days = st.sidebar.number_input("Forecast Days Ahead", min_value=1, max_value=365, value=30)
+    run = st.sidebar.button("🚀 Run Analysis", type="primary")
     
-    if run_button:
-        ticker = ticker_input.strip().upper()
-        if not ticker:
-            st.error("Please enter a valid stock ticker.")
+    if run:
+        if not ticker_input:
+            st.error("Please enter a ticker.")
             return
         
-        progress_bar = st.progress(0)
-        status_text = st.empty()
+        progress = st.progress(0)
+        status = st.empty()
         
         try:
-            # 1. Load Data
-            status_text.text("📥 Loading data...")
-            progress_bar.progress(10)
-            data = load_data(ticker)
+            # 1. Load data
+            status.text("Loading data...")
+            progress.progress(10)
+            data = load_data(ticker_input)
             if data.empty:
-                st.error("No data found.")
+                st.error(f"No data for {ticker_input}")
                 return
-
-            # 2. Stats Analysis
-            status_text.text("📊 Analyzing statistics...")
-            progress_bar.progress(25)
-            stats_results = statistical_analysis(data.copy())
-            data = stats_results['data']
-
-            # 3. Heston Model
-            status_text.text("🔄 Applying Heston model...")
-            progress_bar.progress(40)
-            heston_params, v_path, data = heston_model(data)
-
+            
+            # 2. Stats
+            status.text("Statistical analysis...")
+            progress.progress(20)
+            stats_res = statistical_analysis(data.copy())
+            data = stats_res['data']
+            
+            st.success(f"Data loaded: {len(data)} points from {data.index[0].date()} to {data.index[-1].date()}")
+            
+            # Display stats (same as before - omitted for brevity)
+            st.markdown("## 📊 Return Statistics")
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Mean Return", f"{stats_res['mean_return']:.6f}")
+            col2.metric("Volatility", f"{stats_res['volatility']:.4f}")
+            col3.metric("Skewness", f"{stats_res['skewness']:.3f}")
+            col4.metric("Kurtosis", f"{stats_res['pearson_kurtosis']:.2f}")
+            st.write(f"**Tail Behavior:** {stats_res['tail_type']}")
+            
+            # 3. Heston
+            status.text("Fitting Heston model...")
+            progress.progress(40)
+            heston_params, data = heston_model(data)
+            
             # 4. Prepare & Train
-            status_text.text("🧠 Training Neural Network...")
-            progress_bar.progress(55)
+            status.text("Training GRU...")
+            progress.progress(60)
             seq_len = 60
             X_train, X_test, y_train, y_test, scaler, scaled_features = prepare_sequences(data, seq_len)
-            model, history = build_gru_model(X_train, y_train, X_test, y_test)
-
-            # 5. Evaluate (Train/Test Predictions)
-            status_text.text("📈 Evaluating model...")
-            progress_bar.progress(70)
-            eval_results = evaluate_model(model, X_train, y_train, X_test, y_test, scaler, scaled_features)
-
-            # 6. Future Forecast
-            status_text.text(f"🔮 Forecasting {n_days} days ahead...")
-            progress_bar.progress(85)
-            future_dates, future_prices, future_vols = future_forecast(
-                model, data, scaler, scaled_features, seq_len, n_days, heston_params
-            )
-
-            # ========================================================================
-            # UNIFIED PLOTTING SECTION
-            # ========================================================================
-            st.markdown("## 🔮 Comprehensive Forecast Chart")
-            st.info("This chart combines historical training/testing validation with future projections.")
-
-            # Create Indices for Plotting
-            train_len = len(eval_results['pred_rescaled_train'])
-            test_len = len(eval_results['pred_rescaled'])
+            model, _ = build_gru_model(X_train, y_train, X_test, y_test)
             
-            # The indices align with the sequence length offset
-            train_index = data.index[seq_len : seq_len + train_len]
-            test_index = data.index[seq_len + train_len : seq_len + train_len + test_len]
+            # 5. Evaluate
+            progress.progress(75)
+            eval_res = evaluate_model(model, X_train, y_train, X_test, y_test, scaler, scaled_features)
             
-            fig, ax = plt.subplots(figsize=(16, 8))
+            # 6. Forecast
+            status.text("Generating future forecast...")
+            progress.progress(90)
+            last_date = data.index[-1]
+            future_dates = pd.date_range(start=last_date + pd.Timedelta(days=1), periods=n_days, freq='B')
+            future_prices, future_vols = future_forecast(model, scaled_features, scaler, seq_len, n_days, heston_params)
             
-            # 1. Plot Full Historical Data (Background)
-            # We strip the first seq_len because the model can't predict those without history
-            plot_data = data.iloc[seq_len:]
-            ax.plot(plot_data.index, plot_data['Price'], label='Actual Price', color='black', alpha=0.3, linewidth=2)
+            # === UNIFIED CHART ===
+            st.markdown("## 📈 Complete Prediction Timeline")
             
-            # 2. Plot Train Predictions
-            ax.plot(train_index, eval_results['pred_rescaled_train'], label='Train Prediction', color='green', alpha=0.8, linewidth=1.5)
+            train_len = len(eval_res['actual_prices_train'])
+            test_len = len(eval_res['actual_prices'])
+            plot_start_idx = seq_len
+            plot_dates = data.index[plot_start_idx : plot_start_idx + train_len + test_len]
             
-            # 3. Plot Test Predictions
-            ax.plot(test_index, eval_results['pred_rescaled'], label='Test Prediction', color='blue', alpha=0.8, linewidth=1.5)
+            fig, ax = plt.subplots(figsize=(15, 8))
             
-            # 4. Plot Future Forecast
-            ax.plot(future_dates, future_prices, label=f'Future Forecast ({n_days} Days)', color='red', linewidth=2.5, linestyle='--')
+            # Historical train
+            ax.plot(plot_dates[:train_len], eval_res['actual_prices_train'], 
+                    label="Actual (Train)", color="blue", linewidth=2)
+            ax.plot(plot_dates[:train_len], eval_res['pred_rescaled_train'], 
+                    label="Predicted (Train)", color="lightblue", linestyle="--", linewidth=2)
             
-            # 5. Confidence Intervals (Using Forecasted Volatility)
-            upper_bound = future_prices + 1.96 * np.array(future_vols) * future_prices
-            lower_bound = future_prices - 1.96 * np.array(future_vols) * future_prices
-            ax.fill_between(future_dates, lower_bound, upper_bound, color='red', alpha=0.1, label='95% Confidence Interval')
-
-            # Formatting
-            ax.axvline(x=data.index[-1], color='gray', linestyle=':', linewidth=2, label='Today')
-            ax.set_title(f"{ticker} - Unified Forecast (Train, Test & Future)", fontsize=16)
-            ax.set_xlabel("Date", fontsize=12)
-            ax.set_ylabel("Price", fontsize=12)
-            ax.legend(loc='upper left')
+            # Test period
+            test_dates = plot_dates[train_len:]
+            ax.plot(test_dates, eval_res['actual_prices'], 
+                    label="Actual (Test)", color="green", linewidth=2)
+            ax.plot(test_dates, eval_res['pred_rescaled'], 
+                    label="Predicted (Test)", color="orange", linestyle="--", linewidth=2)
+            
+            # Future forecast
+            ax.plot(future_dates, future_prices, 
+                    label=f"Forecast ({n_days} days)", color="red", marker="o", markersize=3, linewidth=2.5)
+            
+            # Confidence band
+            daily_vol_factor = np.array(future_vols) * np.sqrt(1/252)
+            upper = future_prices * (1 + 1.96 * daily_vol_factor)
+            lower = future_prices * (1 - 1.96 * daily_vol_factor)
+            ax.fill_between(future_dates, lower, upper, color="red", alpha=0.15, label="95% Confidence")
+            
+            # Lines
+            ax.axvline(plot_dates[train_len-1], color="gray", linestyle="--", label="Train/Test Split")
+            ax.axvline(last_date, color="black", linewidth=2, label="Today")
+            
+            ax.set_title(f"{ticker_input} — Full Price Prediction (Historical + Forecast)", fontsize=16)
+            ax.set_xlabel("Date")
+            ax.set_ylabel("Price")
+            ax.legend(loc="upper left")
             ax.grid(True, alpha=0.3)
-            
             st.pyplot(fig)
-
-            # ========================================================================
-            # METRICS DISPLAY
-            # ========================================================================
-            st.markdown("### 📊 Model & Forecast Metrics")
-            col1, col2, col3, col4 = st.columns(4)
             
-            with col1:
-                st.metric("Test RMSE (Error)", f"{eval_results['rmse_test']:.2f}")
-            with col2:
-                st.metric("Test Accuracy (R²)", f"{eval_results['r2_test']:.2f}")
-            with col3:
-                curr_price = data['Price'].iloc[-1]
-                st.metric("Current Price", f"{curr_price:.2f}")
-            with col4:
-                final_pred = future_prices[-1]
-                pct_change = ((final_pred - curr_price) / curr_price) * 100
-                st.metric(f"Price in {n_days} Days", f"{final_pred:.2f}", f"{pct_change:+.2f}%")
-
-            # Data Table for Future
-            with st.expander("📄 View Future Forecast Data"):
-                future_df = pd.DataFrame({
-                    'Date': future_dates,
-                    'Forecasted Price': future_prices,
-                    'Lower Bound (95%)': lower_bound,
-                    'Upper Bound (95%)': upper_bound
-                })
-                st.dataframe(future_df)
-
-            progress_bar.progress(100)
-            status_text.text("✅ Analysis complete!")
-
+            # Metrics & Table
+            col1, col2, col3, col4 = st.columns(4)
+            col1.metric("Current Price", f"${data['Price'].iloc[-1]:.2f}")
+            col2.metric("Tomorrow Forecast", f"${future_prices[0]:.2f}")
+            col3.metric(f"Day {n_days} Forecast", f"${future_prices[-1]:.2f}")
+            change = (future_prices[-1] / data['Price'].iloc[-1] - 1) * 100
+            col4.metric(f"Expected Change", f"{change:+.2f}%")
+            
+            future_df = pd.DataFrame({
+                "Date": future_dates.date,
+                "Predicted Price": np.round(future_prices, 2),
+                "Volatility": np.round(future_vols, 4)
+            })
+            st.markdown("### Forecast Table")
+            st.dataframe(future_df, use_container_width=True)
+            
+            progress.progress(100)
+            status.text("✅ Complete!")
+            st.success("Analysis and forecast completed successfully!")
+            
         except Exception as e:
             st.error(f"Error: {str(e)}")
             st.exception(e)
